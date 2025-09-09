@@ -91,6 +91,7 @@ class RepoPromptGenerator:
     def should_ignore(self, path: Path) -> bool:
         """Check if a path should be ignored."""
         name = path.name
+        relative_path = str(path.relative_to(self.root_path)).replace('\\', '/')
         
         # Always ignore repo-prompt directory
         if "repo-prompt" in path.parts:
@@ -101,17 +102,27 @@ class RepoPromptGenerator:
             return True
             
         # Check against ignore patterns
+        import fnmatch
         for pattern in self.ignore_patterns:
-            if pattern.startswith('*') and name.endswith(pattern[1:]):
+            # Clean up pattern
+            pattern = pattern.strip()
+            if not pattern or pattern.startswith('#'):
+                continue
+                
+            # Check exact name match
+            if name == pattern:
                 return True
-            elif pattern.endswith('*') and name.startswith(pattern[:-1]):
+                
+            # Check glob pattern match on filename
+            if fnmatch.fnmatch(name, pattern):
                 return True
-            elif '*' in pattern:
-                # Simple glob matching
-                import fnmatch
-                if fnmatch.fnmatch(name, pattern):
-                    return True
-            elif name == pattern:
+                
+            # Check glob pattern match on relative path
+            if fnmatch.fnmatch(relative_path, pattern):
+                return True
+                
+            # Check if pattern matches directory name in path
+            if pattern in path.parts:
                 return True
                 
         return False
@@ -121,14 +132,31 @@ class RepoPromptGenerator:
         return file_path.suffix.lower() in self.binary_extensions
     
     def detect_encoding(self, file_path: Path) -> str:
-        """Detect file encoding."""
+        """Detect file encoding with multiple fallbacks."""
+        encodings_to_try = ['utf-8', 'utf-8-sig', 'latin-1', 'cp1252', 'iso-8859-1']
+        
+        # First try chardet
         try:
             with open(file_path, 'rb') as f:
                 raw = f.read(min(4096, file_path.stat().st_size))
-                result = chardet.detect(raw)
-                return result.get('encoding', 'utf-8') or 'utf-8'
+                if raw:
+                    result = chardet.detect(raw)
+                    detected_encoding = result.get('encoding')
+                    if detected_encoding and result.get('confidence', 0) > 0.7:
+                        return detected_encoding
         except Exception:
-            return 'utf-8'
+            pass
+            
+        # Fallback to trying common encodings
+        for encoding in encodings_to_try:
+            try:
+                with open(file_path, 'r', encoding=encoding) as f:
+                    f.read(1024)  # Try to read a chunk
+                return encoding
+            except (UnicodeDecodeError, UnicodeError):
+                continue
+                
+        return 'utf-8'  # Final fallback
     
     def generate_tree(self, start_path: Optional[Path] = None, prefix: str = "", 
                      max_depth: Optional[int] = None, current_depth: int = 0) -> List[str]:
@@ -184,13 +212,19 @@ class RepoPromptGenerator:
         except Exception:
             return "[Could not read file]"
             
-        # Try to read file
+        # Try to read file with encoding detection
         encoding = self.detect_encoding(file_path)
         try:
             with open(file_path, 'r', encoding=encoding) as f:
                 return f.read()
-        except Exception as e:
-            return f"[Error reading file: {e}]"
+        except Exception:
+            # Final fallback: try with errors='replace' to avoid crashes
+            try:
+                with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+                    content = f.read()
+                    return f"[File read with encoding fallback - some characters may be incorrect]\n\n{content}"
+            except Exception as e:
+                return f"[Error reading file: {e}]"
     
     def collect_files(self, start_path: Optional[Path] = None) -> List[Path]:
         """Recursively collect all files to include."""
